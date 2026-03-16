@@ -61,7 +61,7 @@ impl CliProxy {
                         let _ = log::warn(format!("Accept error: {e:?}, backing off"));
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         continue;
-                    },
+                    }
                 };
                 let _ = log::info("CLI client connected to proxy");
                 streams.push(stream);
@@ -84,11 +84,11 @@ impl CliProxy {
                         if !bytes.is_empty() {
                             handle_ingress(&bytes);
                         }
-                    },
+                    }
                     Err(e) => {
                         let _ = log::error(format!("Socket read error: {e:?}"));
                         dead_indices.push(i);
-                    },
+                    }
                 }
             }
 
@@ -111,11 +111,11 @@ impl CliProxy {
                         if !bytes.is_empty() {
                             broadcast_poll_messages(&streams, &bytes, &mut broadcast_dead);
                         }
-                    },
+                    }
                     Err(_) => {
                         let _ = log::error("IPC subscription error, proxy shutting down");
                         break 'proxy;
-                    },
+                    }
                 }
             }
 
@@ -146,7 +146,7 @@ fn handle_ingress(bytes: &[u8]) {
         Err(_) => {
             let _ = log::warn("Received malformed IPC payload from socket");
             return;
-        },
+        }
     };
 
     let (Some(topic), Some(payload)) = (
@@ -174,7 +174,7 @@ fn broadcast_poll_messages(streams: &[StreamHandle], poll_bytes: &[u8], dead: &m
         Err(_) => {
             let _ = log::warn("Failed to parse poll envelope");
             return;
-        },
+        }
     };
 
     if let Some(dropped) = envelope.get("dropped").and_then(|d| d.as_u64())
