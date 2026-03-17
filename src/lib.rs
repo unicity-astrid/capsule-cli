@@ -14,7 +14,6 @@ impl CliProxy {
         // must NOT be forwarded to the CLI socket.
         let topics = [
             "agent.v1.response",
-            "agent.v1.stream.delta",
             "astrid.v1.onboarding.required",
             "astrid.v1.elicit.*",
             "astrid.v1.approval",
