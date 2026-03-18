@@ -1,4 +1,6 @@
-use astrid_sdk::net::{StreamHandle, accept, bind_unix, close, poll_accept, read, write};
+use astrid_sdk::net::{
+    StreamHandle, TryRecvError, accept, bind_unix, close, send, try_accept, try_recv,
+};
 use astrid_sdk::prelude::*;
 
 #[derive(Default)]
@@ -68,7 +70,7 @@ impl CliProxy {
 
             // Phase B: poll for one additional connection (non-blocking).
             // Max one per iteration to bound handshake stall to ~5s worst case.
-            if let Ok(Some(new_stream)) = poll_accept(&listener) {
+            if let Ok(Some(new_stream)) = try_accept(&listener) {
                 let _ = log::info("Additional CLI client connected to proxy");
                 streams.push(new_stream);
             }
@@ -78,14 +80,11 @@ impl CliProxy {
             // Acceptable for CLI use (2-3 typical, 8 max = 400ms worst case).
             let mut dead_indices: Vec<usize> = Vec::new();
             for (i, stream) in streams.iter().enumerate() {
-                match read(stream) {
-                    Ok(bytes) => {
-                        if !bytes.is_empty() {
-                            handle_ingress(&bytes);
-                        }
-                    }
-                    Err(e) => {
-                        let _ = log::error(format!("Socket read error: {e:?}"));
+                match try_recv(stream) {
+                    Ok(bytes) => handle_ingress(&bytes),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Closed) => {
+                        let _ = log::info("CLI client disconnected from proxy");
                         dead_indices.push(i);
                     }
                 }
@@ -98,7 +97,6 @@ impl CliProxy {
             for &i in dead_indices.iter().rev() {
                 let dead = streams.remove(i);
                 let _ = close(&dead);
-                let _ = log::info("CLI client disconnected from proxy");
             }
 
             // Phase D: poll IPC subscriptions and broadcast to all live streams.
@@ -200,8 +198,10 @@ fn broadcast_poll_messages(streams: &[StreamHandle], poll_bytes: &[u8], dead: &m
             continue;
         }
         for msg_bytes in &serialized {
-            if let Err(e) = write(stream, msg_bytes) {
-                let _ = log::error(format!("Socket write error: {e:?}"));
+            if let Err(e) = send(stream, msg_bytes) {
+                let _ = log::warn(format!(
+                    "Socket send error, client likely disconnected: {e:?}"
+                ));
                 dead.push(i);
                 break; // Skip remaining messages for this dead stream.
             }
