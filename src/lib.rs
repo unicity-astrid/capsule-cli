@@ -198,7 +198,10 @@ fn broadcast_poll_messages(streams: &[StreamHandle], poll_bytes: &[u8], dead: &m
             continue;
         }
         for msg_bytes in &serialized {
-            if send(stream, msg_bytes).is_err() {
+            if let Err(e) = send(stream, msg_bytes) {
+                let _ = log::warn(format!(
+                    "Socket send error, client likely disconnected: {e:?}"
+                ));
                 dead.push(i);
                 break; // Skip remaining messages for this dead stream.
             }
