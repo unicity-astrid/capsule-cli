@@ -180,9 +180,13 @@ fn broadcast_poll_messages(
         .messages
         .iter()
         .filter_map(|msg| {
+            // Parse the payload string back to a JSON value so the TUI
+            // receives an embedded object, not an escaped string.
+            let payload = serde_json::from_str::<serde_json::Value>(&msg.payload)
+                .unwrap_or(serde_json::Value::String(msg.payload.clone()));
             serde_json::to_vec(&serde_json::json!({
                 "topic": msg.topic,
-                "payload": msg.payload,
+                "payload": payload,
                 "source_id": msg.source_id,
             }))
             .ok()
