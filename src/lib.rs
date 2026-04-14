@@ -41,11 +41,8 @@ impl CliProxy {
         let path = runtime::socket_path()
             .map_err(|e| SysError::ApiError(format!("Failed to resolve socket path: {e}")))?;
 
-        let _ = log::log(
-            "info",
-            format!("CLI Proxy: accepting connections on {path}"),
-        );
-        let listener = bind_unix(&path).map_err(|e| SysError::ApiError(e.to_string()))?;
+        log::info(format!("CLI Proxy: accepting connections on {path}"));
+        let listener = bind_unix().map_err(|e| SysError::ApiError(e.to_string()))?;
 
         // 3. Multi-connection accept loop.
         // Supports up to 8 concurrent CLI clients (enforced at host level).
@@ -59,19 +56,19 @@ impl CliProxy {
                 let stream = match accept(&listener) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = log::warn(format!("Accept error: {e:?}, backing off"));
+                        log::warn(format!("Accept error: {e:?}, backing off"));
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         continue;
                     }
                 };
-                let _ = log::info("CLI client connected to proxy");
+                log::info("CLI client connected to proxy");
                 streams.push(stream);
             }
 
             // Phase B: poll for one additional connection (non-blocking).
             // Max one per iteration to bound handshake stall to ~5s worst case.
             if let Ok(Some(new_stream)) = try_accept(&listener) {
-                let _ = log::info("Additional CLI client connected to proxy");
+                log::info("Additional CLI client connected to proxy");
                 streams.push(new_stream);
             }
 
@@ -84,7 +81,7 @@ impl CliProxy {
                     Ok(bytes) => handle_ingress(&bytes),
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Closed) => {
-                        let _ = log::info("CLI client disconnected from proxy");
+                        log::info("CLI client disconnected from proxy");
                         dead_indices.push(i);
                     }
                 }
@@ -103,14 +100,14 @@ impl CliProxy {
             // NOTE: broadcast_dead indices are into streams AFTER Phase C removals.
             let mut broadcast_dead: Vec<usize> = Vec::new();
             for handle in &sub_handles {
-                match ipc::poll_bytes(handle) {
-                    Ok(bytes) => {
-                        if !bytes.is_empty() {
-                            broadcast_poll_messages(&streams, &bytes, &mut broadcast_dead);
+                match ipc::poll(handle) {
+                    Ok(result) => {
+                        if !result.messages.is_empty() {
+                            broadcast_poll_messages(&streams, &result, &mut broadcast_dead);
                         }
                     }
                     Err(_) => {
-                        let _ = log::error("IPC subscription error, proxy shutting down");
+                        log::error("IPC subscription error, proxy shutting down");
                         break 'proxy;
                     }
                 }
@@ -124,7 +121,7 @@ impl CliProxy {
             for &i in broadcast_dead.iter().rev() {
                 let dead = streams.remove(i);
                 let _ = close(&dead);
-                let _ = log::info("CLI client disconnected during broadcast");
+                log::info("CLI client disconnected during broadcast");
             }
         }
 
@@ -141,7 +138,7 @@ fn handle_ingress(bytes: &[u8]) {
     let msg = match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(v) => v,
         Err(_) => {
-            let _ = log::warn("Received malformed IPC payload from socket");
+            log::warn("Received malformed IPC payload from socket");
             return;
         }
     };
@@ -150,46 +147,50 @@ fn handle_ingress(bytes: &[u8]) {
         msg.get("topic").and_then(|t| t.as_str()),
         msg.get("payload"),
     ) else {
-        let _ = log::warn("Dropped ingress message: missing topic or payload");
+        log::warn("Dropped ingress message: missing topic or payload");
         return;
     };
 
     if is_allowed_ingress_topic(topic) {
         if let Err(e) = ipc::publish_json(topic, payload) {
-            let _ = log::error(format!("Failed to publish IPC: {e:?}"));
+            log::error(format!("Failed to publish IPC: {e:?}"));
         }
     } else {
-        let _ = log::warn(format!("Dropped ingress message to blocked topic: {topic}"));
+        log::warn(format!("Dropped ingress message to blocked topic: {topic}"));
     }
 }
 
-/// Parse the poll envelope once, then broadcast each individual `IpcMessage`
-/// to every connected stream. Tracks failed stream indices in `dead`.
-fn broadcast_poll_messages(streams: &[StreamHandle], poll_bytes: &[u8], dead: &mut Vec<usize>) {
-    let envelope: serde_json::Value = match serde_json::from_slice(poll_bytes) {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = log::warn("Failed to parse poll envelope");
-            return;
-        }
-    };
-
-    if let Some(dropped) = envelope.get("dropped").and_then(|d| d.as_u64())
-        && dropped > 0
-    {
-        let _ = log::warn(format!(
-            "Event bus dropped {dropped} messages - TUI may be stale"
+/// Broadcast each IPC message from a `PollResult` to every connected stream.
+/// Tracks failed stream indices in `dead`.
+fn broadcast_poll_messages(
+    streams: &[StreamHandle],
+    poll_result: &ipc::PollResult,
+    dead: &mut Vec<usize>,
+) {
+    if poll_result.dropped > 0 {
+        log::warn(format!(
+            "Event bus dropped {} messages - TUI may be stale",
+            poll_result.dropped
         ));
     }
 
-    let Some(messages) = envelope.get("messages").and_then(|m| m.as_array()) else {
-        return;
-    };
-
     // Pre-serialize each message once, then write to all streams.
-    let serialized: Vec<Vec<u8>> = messages
+    // Reconstruct the wire format the TUI expects: {topic, payload, source_id}.
+    let serialized: Vec<Vec<u8>> = poll_result
+        .messages
         .iter()
-        .filter_map(|msg| serde_json::to_vec(msg).ok())
+        .filter_map(|msg| {
+            // Parse the payload string back to a JSON value so the TUI
+            // receives an embedded object, not an escaped string.
+            let payload = serde_json::from_str::<serde_json::Value>(&msg.payload)
+                .unwrap_or(serde_json::Value::String(msg.payload.clone()));
+            serde_json::to_vec(&serde_json::json!({
+                "topic": msg.topic,
+                "payload": payload,
+                "source_id": msg.source_id,
+            }))
+            .ok()
+        })
         .collect();
 
     for (i, stream) in streams.iter().enumerate() {
@@ -199,7 +200,7 @@ fn broadcast_poll_messages(streams: &[StreamHandle], poll_bytes: &[u8], dead: &m
         }
         for msg_bytes in &serialized {
             if let Err(e) = send(stream, msg_bytes) {
-                let _ = log::warn(format!(
+                log::warn(format!(
                     "Socket send error, client likely disconnected: {e:?}"
                 ));
                 dead.push(i);
