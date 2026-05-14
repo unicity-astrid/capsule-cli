@@ -7,31 +7,47 @@ description = "Native Unix Socket bridge for the Astrid CLI frontend."
 id = "main"
 file = "astrid_capsule_cli.wasm"
 
+[publish]
+"user.v1.prompt" = { wit = "TODO" }                          # no canonical type yet — uplink user prompt envelope
+"client.v1.disconnect" = { wit = "TODO" }                    # no canonical type yet — uplink lifecycle signal
+"cli.v1.command.execute" = { wit = "TODO" }                  # no canonical type yet — CLI slash-command envelope
+"astrid.v1.request.*" = { wit = "TODO" }                     # no canonical type yet — generic kernel request envelope
+"astrid.v1.elicit.response.*" = { wit = "TODO" }             # no canonical type yet — elicitation response
+"astrid.v1.approval.response.*" = { wit = "TODO" }           # no canonical type yet — approval response
+"registry.v1.get_providers" = { wit = "TODO" }               # no canonical type yet — registry query envelope
+"registry.v1.set_active_model" = { wit = "TODO" }            # no canonical type yet — active model setter
+"registry.v1.selection.*" = { wit = "TODO" }                 # no canonical type yet — model selection flow
+"session.v1.request.*" = { wit = "TODO" }                    # wildcard spans get-messages/clear/append — multiple WIT records, leave unresolved
+# Layer 6 admin IPC (issue #672) — per-noun patterns because the
+# ACL matcher (`topic_matches`) requires equal segment counts and
+# admin topics are 5-segment (`astrid.v1.admin.<noun>.<verb>`).
+# Authorization happens kernel-side via the Layer 5 capability-
+# enforcement preamble; the proxy is just a thin pipe.
+"astrid.v1.admin.agent.*" = { wit = "@unicity-astrid/wit/admin/admin-request" }
+"astrid.v1.admin.group.*" = { wit = "@unicity-astrid/wit/admin/admin-request" }
+"astrid.v1.admin.caps.*" = { wit = "@unicity-astrid/wit/admin/admin-request" }
+"astrid.v1.admin.quota.*" = { wit = "@unicity-astrid/wit/admin/admin-request" }
+
+[subscribe]
+"agent.v1.response" = { wit = "TODO" }                       # no canonical type yet — agent response envelope
+"agent.v1.stream.delta" = { wit = "TODO" }                   # no canonical type yet — agent streaming delta
+"astrid.v1.approval" = { wit = "TODO" }                      # no canonical type yet — kernel-issued approval prompt
+"astrid.v1.capsules_loaded" = { wit = "TODO" }               # no canonical type yet — kernel boot signal
+"astrid.v1.elicit.*" = { wit = "TODO" }                      # no canonical type yet — elicitation request
+"astrid.v1.onboarding.required" = { wit = "TODO" }           # no canonical type yet — onboarding prompt
+"astrid.v1.response.*" = { wit = "TODO" }                    # no canonical type yet — generic kernel response envelope
+"registry.v1.response.*" = { wit = "@unicity-astrid/wit/registry/provider-entry" }
+"registry.v1.active_model_changed" = { wit = "TODO" }        # no canonical type yet — active model change notification
+"registry.v1.selection.*" = { wit = "TODO" }                 # no canonical type yet — model selection flow
+"session.v1.response.*" = { wit = "TODO" }                   # wildcard spans get-messages/clear responses — multiple WIT records, leave unresolved
+# Layer 6 admin IPC response topics — 6-segment with trailing
+# wildcard (`astrid.v1.admin.response.<noun>.<verb>`). Mid-segment
+# wildcards are rejected by the matcher, so we enumerate by noun.
+"astrid.v1.admin.response.agent.*" = { wit = "@unicity-astrid/wit/admin/admin-response" }
+"astrid.v1.admin.response.group.*" = { wit = "@unicity-astrid/wit/admin/admin-response" }
+"astrid.v1.admin.response.caps.*" = { wit = "@unicity-astrid/wit/admin/admin-response" }
+"astrid.v1.admin.response.quota.*" = { wit = "@unicity-astrid/wit/admin/admin-response" }
+
 [capabilities]
 uplink = true
 net_bind = ["unix:*"]
-ipc_publish = [
-    "user.v1.prompt",
-    "client.v1.disconnect",
-    "cli.v1.command.execute",
-    "astrid.v1.request.*",
-    "astrid.v1.elicit.response.*",
-    "astrid.v1.approval.response.*",
-    "registry.v1.get_providers",
-    "registry.v1.set_active_model",
-    "registry.v1.selection.*",
-    "session.v1.request.*",
-]
-ipc_subscribe = [
-    "agent.v1.response",
-    "agent.v1.stream.delta",
-    "astrid.v1.approval",
-    "astrid.v1.capsules_loaded",
-    "astrid.v1.elicit.*",
-    "astrid.v1.onboarding.required",
-    "astrid.v1.response.*",
-    "registry.v1.response.*",
-    "registry.v1.active_model_changed",
-    "registry.v1.selection.*",
-    "session.v1.response.*",
-]
