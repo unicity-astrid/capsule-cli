@@ -61,6 +61,15 @@ impl CliProxy {
         // opens the session.
         let mut streams: Vec<StreamHandle> = Vec::new();
         let mut session_owners: HashMap<String, u64> = HashMap::new();
+        // Per-stream principal binding. Populated by `handle_ingress` on
+        // the first principal-stamped message of a stream and consumed
+        // on stream cleanup to publish a correctly-attributed
+        // `client.v1.disconnect`. Without this map the kernel's
+        // `active_connections` counter ends up keyed on the cli
+        // capsule's own (default) principal regardless of which agent
+        // owned the socket, and `astrid who` mis-attributes every
+        // connection to default (#22).
+        let mut stream_principals: HashMap<u64, String> = HashMap::new();
 
         'proxy: loop {
             // Phase A: block until at least one client is connected.
@@ -91,7 +100,12 @@ impl CliProxy {
             for (i, stream) in streams.iter().enumerate() {
                 let stream_id = stream.id();
                 match try_recv(stream) {
-                    Ok(bytes) => handle_ingress(&bytes, stream_id, &mut session_owners),
+                    Ok(bytes) => handle_ingress(
+                        &bytes,
+                        stream_id,
+                        &mut session_owners,
+                        &mut stream_principals,
+                    ),
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Closed) => {
                         log::info("CLI client disconnected from proxy");
@@ -116,6 +130,9 @@ impl CliProxy {
                 let _ = close(&dead);
             }
             session_owners.retain(|_, owner_id| !dead_ids.contains(owner_id));
+            for &id in &dead_ids {
+                publish_stream_disconnect(&mut stream_principals, id);
+            }
 
             // Phase D: poll IPC subscriptions and route to the owning stream(s).
             // NOTE: broadcast_dead indices are into streams AFTER Phase C removals.
@@ -153,6 +170,9 @@ impl CliProxy {
                 log::info("CLI client disconnected during broadcast");
             }
             session_owners.retain(|_, owner_id| !dead_ids.contains(owner_id));
+            for &id in &dead_ids {
+                publish_stream_disconnect(&mut stream_principals, id);
+            }
         }
 
         // Reached only when an IPC subscription fails (break 'proxy above).
@@ -165,7 +185,12 @@ impl CliProxy {
 /// Parse an incoming client message and publish it to the IPC bus if the
 /// topic passes the ingress allowlist. Records session ownership so that
 /// session-scoped responses are routed back to this stream alone.
-fn handle_ingress(bytes: &[u8], stream_id: u64, session_owners: &mut HashMap<String, u64>) {
+fn handle_ingress(
+    bytes: &[u8],
+    stream_id: u64,
+    session_owners: &mut HashMap<String, u64>,
+    stream_principals: &mut HashMap<u64, String>,
+) {
     let msg = match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(v) => v,
         Err(_) => {
@@ -202,12 +227,53 @@ fn handle_ingress(bytes: &[u8], stream_id: u64, session_owners: &mut HashMap<Str
     // `ipc::publish_json` path where the host stamps with `self.principal`
     // (= the cli capsule's own principal, today `default`).
     let claimed_principal = msg.get("principal").and_then(|p| p.as_str());
+
+    // First principal claim on this stream → fire a properly-attributed
+    // `client.v1.connected` so the kernel's `active_connections` counter
+    // (and `astrid who` by extension) binds this connection to the
+    // right agent. The host's net_accept no longer publishes this
+    // event for exactly this reason — see issue #22.
+    if let Some(p) = claimed_principal
+        && !p.is_empty()
+        && !stream_principals.contains_key(&stream_id)
+    {
+        let connect_payload = serde_json::json!({ "type": "connect" });
+        if let Err(e) = ipc::publish_json_as("client.v1.connected", &connect_payload, p) {
+            log::warn(format!(
+                "Failed to publish principal-stamped client.v1.connected: {e:?}"
+            ));
+        } else {
+            stream_principals.insert(stream_id, p.to_string());
+        }
+    }
+
     let result = match claimed_principal {
         Some(p) if !p.is_empty() => ipc::publish_json_as(topic, payload, p),
         _ => ipc::publish_json(topic, payload),
     };
     if let Err(e) = result {
         log::error(format!("Failed to publish IPC: {e:?}"));
+    }
+}
+
+/// Fire a principal-stamped `client.v1.disconnect` for a stream that is
+/// about to be closed. Drains the stream's binding from
+/// `stream_principals`; a stream that never sent a principal-claim
+/// message (and so was never counted in the per-principal active-
+/// connection map) is a no-op here, matching the symmetric "no
+/// connect, no disconnect" rule for idle/zombie sockets (#22).
+fn publish_stream_disconnect(stream_principals: &mut HashMap<u64, String>, stream_id: u64) {
+    let Some(principal) = stream_principals.remove(&stream_id) else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "type": "disconnect",
+        "reason": "stream_closed",
+    });
+    if let Err(e) = ipc::publish_json_as("client.v1.disconnect", &payload, &principal) {
+        log::warn(format!(
+            "Failed to publish principal-stamped client.v1.disconnect: {e:?}"
+        ));
     }
 }
 

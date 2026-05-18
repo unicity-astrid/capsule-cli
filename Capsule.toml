@@ -9,6 +9,7 @@ file = "astrid_capsule_cli.wasm"
 
 [publish]
 "user.v1.prompt" = { wit = "TODO" }                          # no canonical type yet — uplink user prompt envelope
+"client.v1.connected" = { wit = "TODO" }                     # no canonical type yet — uplink connection-up signal, principal-stamped for who(1) attribution (#22)
 "client.v1.disconnect" = { wit = "TODO" }                    # no canonical type yet — uplink lifecycle signal
 "cli.v1.command.execute" = { wit = "TODO" }                  # no canonical type yet — CLI slash-command envelope
 "astrid.v1.request.*" = { wit = "TODO" }                     # no canonical type yet — generic kernel request envelope
