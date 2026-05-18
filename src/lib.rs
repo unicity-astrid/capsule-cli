@@ -195,7 +195,18 @@ fn handle_ingress(bytes: &[u8], stream_id: u64, session_owners: &mut HashMap<Str
         session_owners.insert(session_id.to_string(), stream_id);
     }
 
-    if let Err(e) = ipc::publish_json(topic, payload) {
+    // Propagate the client-asserted principal so the kernel's caller
+    // resolution and Layer 5/6 capability checks see the right identity.
+    // Trust-the-uplink model (#658 covers cryptographic per-connection
+    // auth). Absent / empty principal falls through to the default
+    // `ipc::publish_json` path where the host stamps with `self.principal`
+    // (= the cli capsule's own principal, today `default`).
+    let claimed_principal = msg.get("principal").and_then(|p| p.as_str());
+    let result = match claimed_principal {
+        Some(p) if !p.is_empty() => ipc::publish_json_as(topic, payload, p),
+        _ => ipc::publish_json(topic, payload),
+    };
+    if let Err(e) = result {
         log::error(format!("Failed to publish IPC: {e:?}"));
     }
 }
