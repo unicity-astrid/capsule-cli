@@ -8,7 +8,10 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-astrid-sdk = { version = "0.6.1", features = ["derive"] }
+# TEMPORARY: depends on the framed-API removal from sdk-rust
+# chore/drop-framed-net. Revert to the published version (e.g. 0.6.2)
+# once the SDK release ships.
+astrid-sdk = { git = "https://github.com/unicity-astrid/sdk-rust.git", branch = "chore/drop-framed-net", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

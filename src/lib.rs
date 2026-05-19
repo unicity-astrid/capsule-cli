@@ -1,7 +1,8 @@
-use astrid_sdk::net::{
-    StreamHandle, TryRecvError, accept, bind_unix, close, send, try_accept, try_recv,
-};
+use astrid_sdk::net::{accept, bind_unix, try_accept};
 use astrid_sdk::prelude::*;
+
+mod framing;
+use framing::{FramedError, FramedStream};
 
 #[derive(Default)]
 struct CliProxy;
@@ -48,7 +49,13 @@ impl CliProxy {
         // Supports up to 8 concurrent CLI clients (enforced at host level).
         // IPC events are broadcast to all connected clients. Any authenticated
         // client can send prompts - the daemon is a single agent.
-        let mut streams: Vec<StreamHandle> = Vec::new();
+        //
+        // Each entry pairs the raw StreamHandle with the per-stream framing
+        // state needed to reassemble length-prefixed envelopes across polling
+        // iterations. The host stopped offering framed reads with the net
+        // host-ABI cleanup (length-prefix framing is application-layer); this
+        // capsule owns the protocol now.
+        let mut streams: Vec<FramedStream> = Vec::new();
 
         'proxy: loop {
             // Phase A: block until at least one client is connected.
@@ -62,38 +69,42 @@ impl CliProxy {
                     }
                 };
                 log::info("CLI client connected to proxy");
-                streams.push(stream);
+                streams.push(FramedStream::new(stream));
             }
 
             // Phase B: poll for one additional connection (non-blocking).
             // Max one per iteration to bound handshake stall to ~5s worst case.
             if let Ok(Some(new_stream)) = try_accept(&listener) {
                 log::info("Additional CLI client connected to proxy");
-                streams.push(new_stream);
+                streams.push(FramedStream::new(new_stream));
             }
 
             // Phase C: read from all streams.
             // NOTE: 50ms timeout per stream = linear scaling (N*50ms per iteration).
             // Acceptable for CLI use (2-3 typical, 8 max = 400ms worst case).
             let mut dead_indices: Vec<usize> = Vec::new();
-            for (i, stream) in streams.iter().enumerate() {
-                match try_recv(stream) {
-                    Ok(bytes) => handle_ingress(&bytes),
-                    Err(TryRecvError::Empty) => {}
-                    Err(TryRecvError::Closed) => {
+            for (i, stream) in streams.iter_mut().enumerate() {
+                match stream.try_recv() {
+                    Ok(Some(bytes)) => handle_ingress(&bytes),
+                    Ok(None) => {}
+                    Err(FramedError::Closed) => {
                         log::info("CLI client disconnected from proxy");
+                        dead_indices.push(i);
+                    }
+                    Err(FramedError::Io(msg)) => {
+                        log::warn(format!("Stream read error, dropping client: {msg}"));
                         dead_indices.push(i);
                     }
                 }
             }
 
             // Remove dead streams in reverse order to preserve indices.
-            // close() is required to release the host-side active_streams entry.
+            // FramedStream::close releases the host-side active_streams entry.
             // Without it, active_streams.len() grows monotonically and poll_accept
             // refuses new connections after MAX_ACTIVE_STREAMS cumulative disconnects.
             for &i in dead_indices.iter().rev() {
                 let dead = streams.remove(i);
-                let _ = close(&dead);
+                dead.close();
             }
 
             // Phase D: poll IPC subscriptions and broadcast to all live streams.
@@ -120,7 +131,7 @@ impl CliProxy {
             broadcast_dead.dedup();
             for &i in broadcast_dead.iter().rev() {
                 let dead = streams.remove(i);
-                let _ = close(&dead);
+                dead.close();
                 log::info("CLI client disconnected during broadcast");
             }
         }
@@ -163,7 +174,7 @@ fn handle_ingress(bytes: &[u8]) {
 /// Broadcast each IPC message from a `PollResult` to every connected stream.
 /// Tracks failed stream indices in `dead`.
 fn broadcast_poll_messages(
-    streams: &[StreamHandle],
+    streams: &[FramedStream],
     poll_result: &ipc::PollResult,
     dead: &mut Vec<usize>,
 ) {
@@ -199,9 +210,9 @@ fn broadcast_poll_messages(
             continue;
         }
         for msg_bytes in &serialized {
-            if let Err(e) = send(stream, msg_bytes) {
+            if let Err(e) = stream.send(msg_bytes) {
                 log::warn(format!(
-                    "Socket send error, client likely disconnected: {e:?}"
+                    "Socket send error, client likely disconnected: {e}"
                 ));
                 dead.push(i);
                 break; // Skip remaining messages for this dead stream.
