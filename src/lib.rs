@@ -21,10 +21,16 @@ impl CliProxy {
             "astrid.v1.approval",
             "astrid.v1.response.*",
             "astrid.v1.capsules_loaded",
+            "astrid.v1.tool.list.response",
             "registry.v1.response.*",
             "registry.v1.active_model_changed",
             "registry.v1.selection.*",
             "session.v1.response.*",
+            // NOTE: We subscribe to the full `tool.v1.execute.*` family rather
+            // than just `*.result`, because the event bus only supports
+            // trailing-suffix wildcards. Self-echo of the requests we publish
+            // is harmless — clients filter by the `.result` topic suffix.
+            "tool.v1.execute.*",
         ];
         let sub_handles: Vec<_> = topics
             .iter()
@@ -151,12 +157,18 @@ fn handle_ingress(bytes: &[u8]) {
         return;
     };
 
-    if is_allowed_ingress_topic(topic) {
-        if let Err(e) = ipc::publish_json(topic, payload) {
-            log::error(format!("Failed to publish IPC: {e:?}"));
-        }
-    } else {
+    if !is_allowed_ingress_topic(topic) {
         log::warn(format!("Dropped ingress message to blocked topic: {topic}"));
+        return;
+    }
+
+    let principal = msg
+        .get("principal")
+        .and_then(|p| p.as_str())
+        .unwrap_or("default");
+
+    if let Err(e) = ipc::publish_json_as(topic, payload, principal) {
+        log::error(format!("Failed to publish IPC: {e:?}"));
     }
 }
 
@@ -222,8 +234,10 @@ const ALLOWED_INGRESS_PREFIXES: &[&str] = &[
     "astrid.v1.request.",
     "astrid.v1.elicit.response.",
     "astrid.v1.approval.response.",
+    "astrid.v1.tool.list.",
     "registry.v1.selection.",
     "session.v1.request.",
+    "tool.v1.execute.",
 ];
 
 fn is_allowed_ingress_topic(topic: &str) -> bool {
