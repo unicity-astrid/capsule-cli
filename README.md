@@ -32,8 +32,8 @@ Dead streams are detected during read or broadcast phases and cleaned up with ex
 ## Development
 
 ```bash
-rustup target add wasm32-wasip2
-cargo build --target wasm32-wasip2 --release
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown --release
 ```
 
 ## License
