@@ -1,6 +1,6 @@
 [package]
 name = "astrid-capsule-cli"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native Unix Socket bridge for the Astrid CLI frontend."
 
 [[component]]
@@ -15,8 +15,22 @@ ipc_publish = [
     "client.v1.disconnect",
     "cli.v1.command.execute",
     "astrid.v1.request.*",
+    # KernelClient publishes `astrid.v1.request.<method>.<uuid>` (5
+    # segments) for response-channel correlation; the 4-seg pattern
+    # above covers historic publishes without the UUID suffix. The
+    # kernel-side `topic_matches` requires equal segment count, so
+    # each arity gets its own pattern. New `astrid.v1.request.*`
+    # additions with deeper method names would extend this list.
+    "astrid.v1.request.*.*",
     "astrid.v1.elicit.response.*",
     "astrid.v1.approval.response.*",
+    # Admin-API requests forwarded from connected clients
+    # (CLI `astrid invite|caps|group|...` verbs + HTTP gateway).
+    # Method suffix is two segments (`invite.issue`, `agent.create`)
+    # or three (`auth.pair.issue`); each arity needs its own pattern
+    # because `topic_matches` is segment-count-strict.
+    "astrid.v1.admin.*.*",
+    "astrid.v1.admin.*.*.*",
     "registry.v1.get_providers",
     "registry.v1.set_active_model",
     "registry.v1.selection.*",
@@ -30,6 +44,12 @@ ipc_subscribe = [
     "astrid.v1.elicit.*",
     "astrid.v1.onboarding.required",
     "astrid.v1.response.*",
+    # Admin-API responses flow back to clients (CLI verbs, gateway
+    # SSE) on `astrid.v1.admin.response.<method>`. The runtime
+    # subscribe host fn only accepts a single trailing wildcard; the
+    # EventBus then expands it to "1+ remaining segments" so this
+    # one pattern catches every method suffix arity.
+    "astrid.v1.admin.response.*",
     "registry.v1.response.*",
     "registry.v1.active_model_changed",
     "registry.v1.selection.*",

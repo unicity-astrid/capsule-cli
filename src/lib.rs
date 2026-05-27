@@ -18,6 +18,16 @@ impl CliProxy {
             "astrid.v1.elicit.*",
             "astrid.v1.approval",
             "astrid.v1.response.*",
+            // Admin-API responses (issue / list / revoke / agent.* /
+            // group.* / caps.* / quota.* / invite.* / pair-device.*).
+            // The CLI's `astrid invite|caps|group|quota|agent ...`
+            // verbs and the HTTP gateway both round-trip on the
+            // `astrid.v1.admin.response.<method>` topic family. The
+            // runtime `ipc::subscribe` only accepts a single trailing
+            // wildcard — the EventBus then expands it to 1+ remaining
+            // segments so this one pattern catches every method
+            // suffix arity.
+            "astrid.v1.admin.response.*",
             "astrid.v1.capsules_loaded",
             "registry.v1.response.*",
             "registry.v1.active_model_changed",
@@ -226,6 +236,10 @@ const ALLOWED_INGRESS_PREFIXES: &[&str] = &[
     "astrid.v1.request.",
     "astrid.v1.elicit.response.",
     "astrid.v1.approval.response.",
+    // Admin-API requests: `astrid.v1.admin.<method>` for invite /
+    // caps / group / quota / agent / pair-device. Mirrors the
+    // manifest's `astrid.v1.admin.*.*` publish ACL.
+    "astrid.v1.admin.",
     "registry.v1.selection.",
     "session.v1.request.",
 ];
