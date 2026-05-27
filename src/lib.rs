@@ -165,12 +165,33 @@ fn handle_ingress(bytes: &[u8]) {
         return;
     };
 
-    if is_allowed_ingress_topic(topic) {
-        if let Err(e) = ipc::publish_json(topic, payload) {
-            log::error(format!("Failed to publish IPC: {e:?}"));
-        }
-    } else {
+    if !is_allowed_ingress_topic(topic) {
         log::warn(format!("Dropped ingress message to blocked topic: {topic}"));
+        return;
+    }
+
+    // Forward the inbound `principal` field as-is. The CLI and the
+    // HTTP gateway each cryptographically verify the principal
+    // before stamping the IpcMessage they send us; we propagate that
+    // claim to the kernel via `publish_as` so capability checks
+    // attribute the call to the right identity. Without this, every
+    // request runs as the proxy's own principal (the bootstrap
+    // admin) — a privilege escalation that lets any redeem-ed user
+    // perform admin operations.
+    //
+    // The trust posture is "trust the uplink": the kernel doesn't
+    // re-verify, it relies on this capsule's `uplink = true` flag.
+    // The uplink contract is exactly that we've authenticated the
+    // claimed principal before reaching this point.
+    if let Some(principal) = msg.get("principal").and_then(|p| p.as_str()) {
+        if let Err(e) = ipc::publish_json_as(topic, payload, principal) {
+            log::error(format!("Failed to publish IPC as principal: {e:?}"));
+        }
+    } else if let Err(e) = ipc::publish_json(topic, payload) {
+        // No principal stamp on the inbound message — fall back to
+        // the capsule's own principal. Used by pre-handshake
+        // discovery messages where no caller identity exists yet.
+        log::error(format!("Failed to publish IPC: {e:?}"));
     }
 }
 
