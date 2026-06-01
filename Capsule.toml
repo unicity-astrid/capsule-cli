@@ -16,6 +16,13 @@ ipc_publish = [
     "client.v1.disconnect",
     "cli.v1.command.execute",
     "astrid.v1.request.*",
+    # KernelClient adds a correlation UUID suffix to its request
+    # topics (astrid.v1.request.<verb>.<uuid>) so concurrent in-flight
+    # calls each get a private response channel. Without the 5-seg
+    # pattern below, every gateway-side KernelRequest (e.g. /api/capsules)
+    # — and every CLI command going through KernelClient (astrid who,
+    # astrid daemon status, astrid ps) — is denied at publish time.
+    "astrid.v1.request.*.*",
     # Admin topics under astrid.v1.admin.<group>.<verb>[.<sub>] — host
     # publish cap-check uses strict segment-count matching, so list
     # each depth (5-seg covers invite/agent/group/quota/caps, 6-seg
