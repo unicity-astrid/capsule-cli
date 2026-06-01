@@ -16,6 +16,12 @@ ipc_publish = [
     "client.v1.disconnect",
     "cli.v1.command.execute",
     "astrid.v1.request.*",
+    # Admin topics under astrid.v1.admin.<group>.<verb>[.<sub>] — host
+    # publish cap-check uses strict segment-count matching, so list
+    # each depth (5-seg covers invite/agent/group/quota/caps, 6-seg
+    # covers auth.pair.*).
+    "astrid.v1.admin.*.*",
+    "astrid.v1.admin.*.*.*",
     "astrid.v1.elicit.response.*",
     "astrid.v1.approval.response.*",
     "registry.v1.get_providers",
@@ -31,6 +37,7 @@ ipc_subscribe = [
     "astrid.v1.elicit.*",
     "astrid.v1.onboarding.required",
     "astrid.v1.response.*",
+    "astrid.v1.admin.response.*",
     "registry.v1.response.*",
     "registry.v1.active_model_changed",
     "registry.v1.selection.*",

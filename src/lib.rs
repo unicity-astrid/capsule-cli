@@ -39,6 +39,7 @@ impl CliProxy {
             "astrid.v1.elicit.*",
             "astrid.v1.approval",
             "astrid.v1.response.*",
+            "astrid.v1.admin.response.*",
             "astrid.v1.capsules_loaded",
             "registry.v1.response.*",
             "registry.v1.active_model_changed",
@@ -303,6 +304,7 @@ const ALLOWED_INGRESS_EXACT: &[&str] = &["user.v1.prompt", "cli.v1.command.execu
 /// IMPORTANT: Update this list when adding new CLI-originated topic prefixes.
 const ALLOWED_INGRESS_PREFIXES: &[&str] = &[
     "astrid.v1.request.",
+    "astrid.v1.admin.",
     "astrid.v1.elicit.response.",
     "astrid.v1.approval.response.",
     "registry.v1.selection.",
