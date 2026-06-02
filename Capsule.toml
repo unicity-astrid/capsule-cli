@@ -18,10 +18,12 @@ ipc_publish = [
     "astrid.v1.request.*",
     "astrid.v1.elicit.response.*",
     "astrid.v1.approval.response.*",
+    "astrid.v1.tool.list.*",
     "registry.v1.get_providers",
     "registry.v1.set_active_model",
     "registry.v1.selection.*",
     "session.v1.request.*",
+    "tool.v1.execute.*",
 ]
 ipc_subscribe = [
     "agent.v1.response",
@@ -31,8 +33,10 @@ ipc_subscribe = [
     "astrid.v1.elicit.*",
     "astrid.v1.onboarding.required",
     "astrid.v1.response.*",
+    "astrid.v1.tool.list.response",
     "registry.v1.response.*",
     "registry.v1.active_model_changed",
     "registry.v1.selection.*",
     "session.v1.response.*",
+    "tool.v1.execute.*",
 ]
