@@ -44,7 +44,14 @@ ipc_subscribe = [
     "astrid.v1.elicit.*",
     "astrid.v1.onboarding.required",
     "astrid.v1.response.*",
+    # Admin response topics are astrid.v1.admin.response.<group>.<verb>[.<sub>].
+    # Strict segment-count matching means a single `*` matches one segment, so
+    # the deeper patterns are needed or multi-segment admin responses never
+    # reach the proxy and CLI admin calls time out. Mirrors the ipc_publish
+    # depth enumeration (astrid.v1.admin.*.* / *.*.*).
     "astrid.v1.admin.response.*",
+    "astrid.v1.admin.response.*.*",
+    "astrid.v1.admin.response.*.*.*",
     "registry.v1.response.*",
     "registry.v1.active_model_changed",
     "registry.v1.selection.*",
