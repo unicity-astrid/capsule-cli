@@ -43,3 +43,4 @@ net_bind = ["unix:*"]
 "registry.v1.active_model_changed" = { wit = "opaque" }
 "registry.v1.selection.*" = { wit = "opaque" }
 "session.v1.response.*" = { wit = "opaque" }
+"cli.v1.command.result.*" = { wit = "opaque" }
