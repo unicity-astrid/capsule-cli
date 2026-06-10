@@ -29,6 +29,7 @@ net_bind = ["unix:*"]
 "registry.v1.set_active_model" = { wit = "opaque" }
 "registry.v1.selection.*" = { wit = "opaque" }
 "session.v1.request.*" = { wit = "opaque" }
+"sage.v1.hook.*" = { wit = "opaque" }
 
 [subscribe]
 "agent.v1.response" = { wit = "opaque" }

@@ -319,6 +319,11 @@ const ALLOWED_INGRESS_PREFIXES: &[&str] = &[
     "astrid.v1.approval.response.",
     "registry.v1.selection.",
     "session.v1.request.",
+    // Native-agent hook events: `astrid-emit` (the Claude/Codex hook pipe) is an
+    // unauthenticated same-user socket client that publishes hook envelopes on
+    // `sage.v1.hook.<event>` for sage's run-loop validator. Without this prefix
+    // the proxy silently drops every hook and the whole hook plane is inert.
+    "sage.v1.hook.",
 ];
 
 /// Prefixes a socket client may NEVER publish, even when they fall under an
