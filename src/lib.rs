@@ -23,15 +23,15 @@ struct CliProxy;
 /// connection that has not yet sent a usable message; such a connection
 /// receives only unprincipaled events.
 ///
-/// `session_id` is the conversation this connection is currently on, learned
-/// from the `session_id` field of its ingress payloads (`user.v1.prompt`,
-/// `session.v1.request.*`). A session-scoped response (a chat
-/// `agent.v1.response`) is delivered only to the connection on that session, so
-/// two connections sharing a principal but on different sessions never
-/// cross-talk. It stays `None` until the connection sends a session-scoped
-/// message; such a connection receives only non-session-scoped traffic
-/// (correlated request/response, system events). It tracks the latest session
-/// observed, so a connection that switches session re-targets its demux.
+/// `session_id` is the conversation this connection is on, learned only from a
+/// forwarded chat prompt (`user.v1.prompt`). Only a chat response
+/// (`agent.v1.response`) is session-demuxed: it is delivered only to the
+/// connection on its session, so two connections sharing a principal but on
+/// different sessions never cross-talk. Correlated request/response and system
+/// traffic stay principal-routed (and are correlation-id filtered by the TUI),
+/// so a connection that has not yet bound a session is never starved of them.
+/// It stays `None` until the connection sends a prompt, and tracks the latest
+/// session observed, so a connection that switches session re-targets its demux.
 ///
 /// This binding is independent of connection-count tracking: the kernel's
 /// per-principal connection counter is driven by host-emitted
@@ -160,16 +160,53 @@ fn should_deliver(
     }
 }
 
-/// Extract the conversation `session_id` from a message payload, if present.
+/// Topic carrying a connection's chat input. The `session_id` on a *forwarded*
+/// message of this topic is the authoritative source for which conversation the
+/// connection is on (paired with [`CHAT_RESPONSE_TOPIC`]).
+const CHAT_REQUEST_TOPIC: &str = "user.v1.prompt";
+
+/// Topic carrying streamed chat responses — the only outbound topic that is
+/// session-demuxed. Everything else routes by principal alone (correlated
+/// request/response topics are already correlation-id filtered by the TUI), so
+/// a non-chat response that merely happens to carry a `session_id` is never
+/// dropped for a connection that has not bound that session.
+const CHAT_RESPONSE_TOPIC: &str = "agent.v1.response";
+
+/// Extract the top-level `"session_id"` string from a message payload, if any.
 ///
-/// Session-scoped payloads (`agent.v1.response`, `user.v1.prompt`,
-/// `session.v1.request.*`) carry a top-level `"session_id"` string (the
-/// `IpcPayload` enum is internally tagged, so the field sits beside `"type"`);
-/// everything else returns `None` and routes by principal alone. Used on both
-/// sides of the bridge: to learn a connection's session from ingress, and to
-/// route outbound responses back to it.
+/// Low-level helper: the `IpcPayload` enum is internally tagged, so `session_id`
+/// sits beside `"type"`. Callers gate on the *topic* before applying it (see
+/// [`ingress_session_bind`] / [`outbound_session_scope`]) — session routing is
+/// scoped to the chat request/response pair, never to every payload that
+/// happens to carry a session id.
 fn payload_session_id(payload: &serde_json::Value) -> Option<&str> {
     payload.get("session_id").and_then(|v| v.as_str())
+}
+
+/// The conversation session a connection should bind from an *ingress* message,
+/// or `None` to leave the current binding unchanged.
+///
+/// Only a chat prompt ([`CHAT_REQUEST_TOPIC`]) retargets the connection's
+/// session. The caller applies this solely to forwarded (allowlisted) traffic,
+/// so a dropped, blocked, or no-body message can never spoof a connection onto
+/// another session.
+fn ingress_session_bind<'a>(topic: &str, payload: &'a serde_json::Value) -> Option<&'a str> {
+    (topic == CHAT_REQUEST_TOPIC)
+        .then(|| payload_session_id(payload))
+        .flatten()
+}
+
+/// The conversation session an *outbound* message is scoped to for demux, or
+/// `None` to route by principal alone.
+///
+/// Only streamed chat responses ([`CHAT_RESPONSE_TOPIC`]) are session-scoped.
+/// Correlated request/response replies keep principal routing even when their
+/// payload carries a `session_id`, so a connection awaiting such a reply (whose
+/// own session may not yet be bound) is never starved.
+fn outbound_session_scope<'a>(topic: &str, payload: &'a serde_json::Value) -> Option<&'a str> {
+    (topic == CHAT_RESPONSE_TOPIC)
+        .then(|| payload_session_id(payload))
+        .flatten()
 }
 
 /// Collapse an SDK [`ipc::PrincipalAttribution`] to the target principal for
@@ -381,10 +418,11 @@ struct IngressOutcome {
     /// connection, so the caller logs the bind once; `None` otherwise
     /// (already bound, malformed, dropped).
     newly_bound: Option<String>,
-    /// The conversation `session_id` carried by this *accepted* message, if any.
-    /// The caller updates the connection's current session so outbound responses
-    /// on that session route back here. `None` for dropped messages and messages
-    /// with no session.
+    /// The conversation `session_id` this message binds the connection to, set
+    /// only by a forwarded chat prompt ([`CHAT_REQUEST_TOPIC`]). The caller folds
+    /// it onto the connection so outbound chat responses on that session route
+    /// back here. `None` for every other message (dropped, blocked, no-body, or
+    /// any non-prompt topic), which leaves the connection's session unchanged.
     session_id: Option<String>,
 }
 
@@ -431,48 +469,50 @@ fn handle_ingress(bytes: &[u8], current_binding: Option<&str>) -> IngressOutcome
         }
     };
 
-    // Learn the connection's current conversation session from this accepted
-    // message (chat prompts / session requests carry a top-level `session_id`).
-    // Latest-wins so a connection that starts a new session (clear/compact)
-    // re-targets its outbound demux; a message with no session leaves the
-    // connection's current session unchanged.
-    let session_id = msg
-        .get("payload")
-        .and_then(payload_session_id)
-        .map(str::to_string);
-
     let (Some(topic), Some(payload)) = (
         msg.get("topic").and_then(|t| t.as_str()),
         msg.get("payload"),
     ) else {
         // No forwardable body, but the principal still binds the connection
         // (e.g. a bare handshake establishes identity for connect-tracking).
+        // Nothing is forwarded, so the connection's session is never retargeted.
         log::warn("Ingress message has no topic/payload; binding only, nothing forwarded");
         return IngressOutcome {
             newly_bound,
-            session_id,
+            session_id: None,
         };
     };
 
-    if is_allowed_ingress_topic(topic) {
-        // Always forward under the connection's bound principal. There is no
-        // `publish_json` (proxy self-identity) fallback for client traffic:
-        // publishing without a principal would attribute the request to the
-        // proxy capsule's own (admin-seeded) identity, so any socket client
-        // could run admin commands (privilege escalation) — or, if the router
-        // gates on the envelope principal, every admin request would be denied
-        // for lacking one. A bound connection's traffic always attributes to
-        // its principal (auto-attribution for un-stamped messages).
-        if let Err(e) = ipc::publish_json_as(topic, payload, &forward_as) {
-            log::error(format!("Failed to publish IPC: {e:?}"));
-        }
-    } else {
+    if !is_allowed_ingress_topic(topic) {
+        // A blocked-topic message is neither forwarded nor allowed to retarget
+        // the connection's session — otherwise a client could spoof itself onto
+        // another session's stream with an unforwarded message.
         log::warn(format!("Dropped ingress message to blocked topic: {topic}"));
+        return IngressOutcome {
+            newly_bound,
+            session_id: None,
+        };
     }
 
+    // Always forward under the connection's bound principal. There is no
+    // `publish_json` (proxy self-identity) fallback for client traffic:
+    // publishing without a principal would attribute the request to the
+    // proxy capsule's own (admin-seeded) identity, so any socket client
+    // could run admin commands (privilege escalation) — or, if the router
+    // gates on the envelope principal, every admin request would be denied
+    // for lacking one. A bound connection's traffic always attributes to
+    // its principal (auto-attribution for un-stamped messages).
+    if let Err(e) = ipc::publish_json_as(topic, payload, &forward_as) {
+        log::error(format!("Failed to publish IPC: {e:?}"));
+    }
+
+    // Learn the connection's conversation session only from a forwarded chat
+    // prompt — the authoritative, allowlisted source. Latest-wins so a
+    // connection that starts a new session (clear/compact) re-targets its
+    // outbound demux; any other forwarded topic leaves the binding unchanged.
     IngressOutcome {
         newly_bound,
-        session_id,
+        session_id: ingress_session_bind(topic, payload).map(str::to_string),
     }
 }
 
@@ -486,10 +526,10 @@ struct OutboundMessage {
     session: Option<String>,
 }
 
-/// Fan a `PollResult` out to connected clients, demultiplexed by principal so a
-/// bound connection only sees IPC stamped with its own principal (plus
-/// unprincipaled system events). Tracks failed stream indices (into `clients`)
-/// in `dead`.
+/// Fan a `PollResult` out to connected clients, demultiplexed by principal AND
+/// session so a bound connection only sees IPC stamped with its own principal
+/// (plus unprincipaled system events), and a chat response only when it is on
+/// that session. Tracks failed stream indices (into `clients`) in `dead`.
 fn broadcast_poll_messages(
     clients: &[ProxyClient],
     poll_result: &ipc::PollResult,
@@ -513,9 +553,10 @@ fn broadcast_poll_messages(
             // receives an embedded object, not an escaped string.
             let payload = serde_json::from_str::<serde_json::Value>(&msg.payload)
                 .unwrap_or(serde_json::Value::String(msg.payload.clone()));
-            // Read the session scope off the same parsed payload (free here) so
-            // a chat response routes only to the connection on that session.
-            let session = payload_session_id(&payload).map(str::to_string);
+            // Scope to a session only for chat responses (free off the already-
+            // parsed payload) so a chat response routes only to the connection on
+            // that session; correlated/system replies stay principal-routed.
+            let session = outbound_session_scope(&msg.topic, &payload).map(str::to_string);
             let bytes = serde_json::to_vec(&serde_json::json!({
                 "topic": msg.topic,
                 "payload": payload,
@@ -806,6 +847,80 @@ mod tests {
             payload_session_id(&serde_json::json!("not-an-object")),
             None
         );
+    }
+
+    // --- chat-topic session scoping (review: bootstrap + spoof safety) ---
+
+    #[test]
+    fn ingress_binds_session_only_from_chat_prompt() {
+        let with_sid = serde_json::json!({"type": "user_input", "session_id": "S1"});
+        assert_eq!(
+            ingress_session_bind(CHAT_REQUEST_TOPIC, &with_sid),
+            Some("S1")
+        );
+        // A non-prompt topic never retargets the connection's session, even when
+        // its payload carries a session_id (same-principal spoof guard).
+        assert_eq!(
+            ingress_session_bind("session.v1.request.create", &with_sid),
+            None
+        );
+        assert_eq!(
+            ingress_session_bind("astrid.v1.admin.agent.list", &with_sid),
+            None
+        );
+        // A prompt with no session_id leaves the binding unchanged.
+        assert_eq!(
+            ingress_session_bind(
+                CHAT_REQUEST_TOPIC,
+                &serde_json::json!({"type": "user_input"})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn outbound_scopes_session_only_for_chat_response() {
+        let with_sid = serde_json::json!({"type": "agent_response", "session_id": "S1"});
+        assert_eq!(
+            outbound_session_scope(CHAT_RESPONSE_TOPIC, &with_sid),
+            Some("S1")
+        );
+        // A correlated reply that happens to carry a session_id is NOT
+        // session-gated.
+        assert_eq!(
+            outbound_session_scope("session.v1.response.create.abc", &with_sid),
+            None
+        );
+        assert_eq!(
+            outbound_session_scope("registry.v1.response.x", &with_sid),
+            None
+        );
+        // A chat response without a session_id routes by principal alone.
+        assert_eq!(
+            outbound_session_scope(
+                CHAT_RESPONSE_TOPIC,
+                &serde_json::json!({"type": "agent_response"})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn correlated_reply_with_session_id_is_not_dropped_for_unbound_session_client() {
+        // Regression for the bootstrap case raised in review: a correlated /
+        // session-creation reply carries a session_id, but the requesting
+        // connection has not bound a session yet (client_session = None). Because
+        // the reply is not chat-scoped, its outbound scope is None, so the
+        // principal gate alone governs and it is delivered (not dropped).
+        let reply = serde_json::json!({"type": "session_created", "session_id": "S_new"});
+        let scope = outbound_session_scope("session.v1.response.create.abc", &reply);
+        assert_eq!(scope, None);
+        assert!(should_deliver(
+            Some("default"),
+            scope,
+            Some("default"),
+            None
+        ));
     }
 
     // --- attribution target mapping ---
