@@ -18,17 +18,28 @@ struct CliProxy;
 ///
 /// Once bound, all of this connection's traffic attributes to its principal,
 /// and it only receives outbound IPC stamped with that same principal (plus
-/// unprincipaled system events) — `principal` is the key the outbound demux
-/// ([`should_deliver`]) routes on. It stays `None` only for a connection that
-/// has not yet sent a usable message; such a connection receives only
-/// unprincipaled events.
+/// unprincipaled system events). The outbound demux ([`should_deliver`]) routes
+/// on two keys: `principal` AND `session_id`. It stays `None` only for a
+/// connection that has not yet sent a usable message; such a connection
+/// receives only unprincipaled events.
+///
+/// `session_id` is the conversation this connection is currently on, learned
+/// from the `session_id` field of its ingress payloads (`user.v1.prompt`,
+/// `session.v1.request.*`). A session-scoped response (a chat
+/// `agent.v1.response`) is delivered only to the connection on that session, so
+/// two connections sharing a principal but on different sessions never
+/// cross-talk. It stays `None` until the connection sends a session-scoped
+/// message; such a connection receives only non-session-scoped traffic
+/// (correlated request/response, system events). It tracks the latest session
+/// observed, so a connection that switches session re-targets its demux.
 ///
 /// This binding is independent of connection-count tracking: the kernel's
 /// per-principal connection counter is driven by host-emitted
-/// `client.v1.connect` / `client.v1.disconnect`, not by this field.
+/// `client.v1.connect` / `client.v1.disconnect`, not by these fields.
 struct ProxyClient {
     stream: TcpStream,
     principal: Option<String>,
+    session_id: Option<String>,
 }
 
 impl ProxyClient {
@@ -36,6 +47,7 @@ impl ProxyClient {
         Self {
             stream,
             principal: None,
+            session_id: None,
         }
     }
 }
@@ -114,17 +126,50 @@ fn decide_ingress(
     }
 }
 
-/// Pure outbound-demux decision: should an IPC message stamped with
-/// `msg_principal` be delivered to a client bound to `client_binding`?
+/// Pure outbound-demux decision: should an IPC message attributed to
+/// `msg_principal` and scoped to `msg_session` be delivered to a client bound to
+/// `client_principal` on session `client_session`?
 ///
-/// * Message principal `Some(p)` -> only clients bound to exactly `p`.
-/// * Message principal `None` (system/broadcast) -> every client, including
-///   still-unbound ones.
-fn should_deliver(msg_principal: Option<&str>, client_binding: Option<&str>) -> bool {
-    match msg_principal {
+/// Two gates, both must pass:
+///
+/// * PRINCIPAL — `Some(p)` delivers only to clients bound to exactly `p`;
+///   `None` (system/broadcast) passes for every client, including unbound ones.
+/// * SESSION — `Some(s)` (a session-scoped message, e.g. a chat
+///   `agent.v1.response`) delivers only to the client currently on session `s`;
+///   `None` (not session-scoped: correlated request/response, system events)
+///   passes for every client that cleared the principal gate. A session-scoped
+///   message is therefore never delivered to a connection on a different
+///   session — or to one with no session yet — which is what prevents
+///   same-principal, multi-session cross-talk.
+fn should_deliver(
+    msg_principal: Option<&str>,
+    msg_session: Option<&str>,
+    client_principal: Option<&str>,
+    client_session: Option<&str>,
+) -> bool {
+    let principal_ok = match msg_principal {
         None => true,
-        Some(p) => client_binding == Some(p),
+        Some(p) => client_principal == Some(p),
+    };
+    if !principal_ok {
+        return false;
     }
+    match msg_session {
+        None => true,
+        Some(s) => client_session == Some(s),
+    }
+}
+
+/// Extract the conversation `session_id` from a message payload, if present.
+///
+/// Session-scoped payloads (`agent.v1.response`, `user.v1.prompt`,
+/// `session.v1.request.*`) carry a top-level `"session_id"` string (the
+/// `IpcPayload` enum is internally tagged, so the field sits beside `"type"`);
+/// everything else returns `None` and routes by principal alone. Used on both
+/// sides of the bridge: to learn a connection's session from ingress, and to
+/// route outbound responses back to it.
+fn payload_session_id(payload: &serde_json::Value) -> Option<&str> {
+    payload.get("session_id").and_then(|v| v.as_str())
 }
 
 /// Collapse an SDK [`ipc::PrincipalAttribution`] to the target principal for
@@ -190,12 +235,14 @@ impl CliProxy {
         // Supports up to 8 concurrent CLI clients (enforced at host level).
         //
         // Each connection binds to exactly one principal on its first message
-        // (see `ProxyClient` / `decide_ingress`) and stays bound for life. A
-        // connection's ingress always attributes to its bound principal; its
-        // egress is demuxed so it only receives IPC stamped with that principal
-        // (plus unprincipaled system events). There is no cross-principal
-        // leakage in either direction and no broadcast-to-all of principaled
-        // traffic.
+        // (see `ProxyClient` / `decide_ingress`) and stays bound for life, and
+        // tracks the conversation session it is on. A connection's ingress
+        // always attributes to its bound principal; its egress is demuxed on
+        // both principal AND session, so it only receives IPC stamped with that
+        // principal (plus unprincipaled system events), and a session-scoped
+        // response only when it is on that session. There is no cross-principal
+        // leakage, no same-principal cross-session leakage, and no
+        // broadcast-to-all of principaled traffic.
         //
         // TcpStream is the post-#752 unified handle (Unix-domain accepts and
         // outbound TCP share the same resource type). Drop releases the
@@ -258,9 +305,15 @@ impl CliProxy {
                         // then keys on. Connection lifecycle tracking
                         // (`client.v1.connect` / `client.v1.disconnect`) is NOT
                         // emitted here — the host owns it (see below).
-                        if let Some(bound) = handle_ingress(&bytes, client.principal.as_deref()) {
+                        let outcome = handle_ingress(&bytes, client.principal.as_deref());
+                        if let Some(bound) = outcome.newly_bound {
                             log::info(format!("CLI connection bound to principal {bound}"));
                             client.principal = Some(bound);
+                        }
+                        // Track the latest conversation session so outbound
+                        // responses route only to the connection on that session.
+                        if let Some(session) = outcome.session_id {
+                            client.session_id = Some(session);
                         }
                     }
                     Err(TryRecvError::Empty) => {}
@@ -321,21 +374,40 @@ impl CliProxy {
     }
 }
 
+/// Outcome of applying the ingress state machine to one client message — the
+/// two pieces of connection state the caller folds back onto the [`ProxyClient`].
+struct IngressOutcome {
+    /// `Some(principal)` only when this message *binds* a previously-unbound
+    /// connection, so the caller logs the bind once; `None` otherwise
+    /// (already bound, malformed, dropped).
+    newly_bound: Option<String>,
+    /// The conversation `session_id` carried by this *accepted* message, if any.
+    /// The caller updates the connection's current session so outbound responses
+    /// on that session route back here. `None` for dropped messages and messages
+    /// with no session.
+    session_id: Option<String>,
+}
+
 /// Parse an incoming client message, apply the per-connection binding state
 /// machine ([`decide_ingress`]), and forward it to the IPC bus if the binding
 /// allows it and the topic passes the ingress allowlist.
 ///
 /// `current_binding` is the connection's principal so far (`None` until the
-/// first usable message binds it). Returns `Some(principal)` only when this
-/// message *binds* a previously-unbound connection, so the caller can emit
-/// `client.v1.connect` exactly once; returns `None` in every other case
-/// (already bound, malformed, dropped).
-fn handle_ingress(bytes: &[u8], current_binding: Option<&str>) -> Option<String> {
+/// first usable message binds it). Returns an [`IngressOutcome`] carrying the
+/// newly-bound principal (only on the binding message) and the conversation
+/// session observed on this message, both of which the caller folds onto the
+/// connection. A dropped/malformed message yields an empty outcome.
+fn handle_ingress(bytes: &[u8], current_binding: Option<&str>) -> IngressOutcome {
+    let empty = IngressOutcome {
+        newly_bound: None,
+        session_id: None,
+    };
+
     let msg = match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(v) => v,
         Err(_) => {
             log::warn("Received malformed IPC payload from socket");
-            return None;
+            return empty;
         }
     };
 
@@ -355,9 +427,19 @@ fn handle_ingress(bytes: &[u8], current_binding: Option<&str>) -> Option<String>
                     "Dropped ingress message: connection bound to {bound:?} but message claimed {claimed:?}"
                 )),
             }
-            return None;
+            return empty;
         }
     };
+
+    // Learn the connection's current conversation session from this accepted
+    // message (chat prompts / session requests carry a top-level `session_id`).
+    // Latest-wins so a connection that starts a new session (clear/compact)
+    // re-targets its outbound demux; a message with no session leaves the
+    // connection's current session unchanged.
+    let session_id = msg
+        .get("payload")
+        .and_then(payload_session_id)
+        .map(str::to_string);
 
     let (Some(topic), Some(payload)) = (
         msg.get("topic").and_then(|t| t.as_str()),
@@ -366,7 +448,10 @@ fn handle_ingress(bytes: &[u8], current_binding: Option<&str>) -> Option<String>
         // No forwardable body, but the principal still binds the connection
         // (e.g. a bare handshake establishes identity for connect-tracking).
         log::warn("Ingress message has no topic/payload; binding only, nothing forwarded");
-        return newly_bound;
+        return IngressOutcome {
+            newly_bound,
+            session_id,
+        };
     };
 
     if is_allowed_ingress_topic(topic) {
@@ -385,15 +470,20 @@ fn handle_ingress(bytes: &[u8], current_binding: Option<&str>) -> Option<String>
         log::warn(format!("Dropped ingress message to blocked topic: {topic}"));
     }
 
-    newly_bound
+    IngressOutcome {
+        newly_bound,
+        session_id,
+    }
 }
 
 /// A polled IPC message ready for outbound delivery: the serialized wire bytes
-/// the TUI expects, plus the principal it is attributed to (`None` = a
-/// system/broadcast event with no principal).
+/// the TUI expects, the principal it is attributed to (`None` = a
+/// system/broadcast event with no principal), and the conversation session it
+/// is scoped to (`None` = not session-scoped, routes by principal alone).
 struct OutboundMessage {
     bytes: Vec<u8>,
     target: Option<String>,
+    session: Option<String>,
 }
 
 /// Fan a `PollResult` out to connected clients, demultiplexed by principal so a
@@ -423,6 +513,9 @@ fn broadcast_poll_messages(
             // receives an embedded object, not an escaped string.
             let payload = serde_json::from_str::<serde_json::Value>(&msg.payload)
                 .unwrap_or(serde_json::Value::String(msg.payload.clone()));
+            // Read the session scope off the same parsed payload (free here) so
+            // a chat response routes only to the connection on that session.
+            let session = payload_session_id(&payload).map(str::to_string);
             let bytes = serde_json::to_vec(&serde_json::json!({
                 "topic": msg.topic,
                 "payload": payload,
@@ -432,6 +525,7 @@ fn broadcast_poll_messages(
             Some(OutboundMessage {
                 bytes,
                 target: attribution_target(&msg.principal).map(str::to_string),
+                session,
             })
         })
         .collect();
@@ -442,9 +536,17 @@ fn broadcast_poll_messages(
             continue;
         }
         for msg in &outbound {
-            // Demux: deliver a principaled message only to the matching bound
-            // client; unprincipaled (system) messages go to everyone.
-            if !should_deliver(msg.target.as_deref(), client.principal.as_deref()) {
+            // Demux on principal AND session: a principaled message reaches only
+            // the matching bound client, and a session-scoped one only the
+            // client on that session (so same-principal connections on different
+            // sessions don't cross-talk). Unprincipaled/unsessioned messages go
+            // to everyone that clears the gates.
+            if !should_deliver(
+                msg.target.as_deref(),
+                msg.session.as_deref(),
+                client.principal.as_deref(),
+                client.session_id.as_deref(),
+            ) {
                 continue;
             }
             if let Err(e) = client.stream.send(&msg.bytes) {
@@ -606,23 +708,104 @@ mod tests {
         );
     }
 
-    // --- outbound demux decision ---
+    // --- outbound demux decision (principal axis) ---
 
     #[test]
     fn principaled_message_delivers_only_to_matching_bound_client() {
-        assert!(should_deliver(Some("alice"), Some("alice")));
-        assert!(!should_deliver(Some("alice"), Some("bob")));
+        assert!(should_deliver(Some("alice"), None, Some("alice"), None));
+        assert!(!should_deliver(Some("alice"), None, Some("bob"), None));
     }
 
     #[test]
     fn principaled_message_not_delivered_to_unbound_client() {
-        assert!(!should_deliver(Some("alice"), None));
+        assert!(!should_deliver(Some("alice"), None, None, None));
     }
 
     #[test]
     fn unprincipaled_message_delivers_to_everyone() {
-        assert!(should_deliver(None, Some("alice")));
-        assert!(should_deliver(None, None)); // even an unbound client
+        assert!(should_deliver(None, None, Some("alice"), None));
+        assert!(should_deliver(None, None, None, None)); // even an unbound client
+    }
+
+    // --- outbound demux decision (session axis: multi-session cross-talk) ---
+
+    #[test]
+    fn session_scoped_message_delivers_only_to_matching_session() {
+        assert!(should_deliver(
+            Some("default"),
+            Some("S1"),
+            Some("default"),
+            Some("S1")
+        ));
+    }
+
+    #[test]
+    fn session_scoped_message_not_delivered_across_sessions_of_same_principal() {
+        // THE cross-talk fix: same principal, different session -> dropped.
+        assert!(!should_deliver(
+            Some("default"),
+            Some("S1"),
+            Some("default"),
+            Some("S2")
+        ));
+    }
+
+    #[test]
+    fn session_scoped_message_not_delivered_to_sessionless_client() {
+        // A connection that has not started a chat session receives no
+        // session-scoped traffic.
+        assert!(!should_deliver(
+            Some("default"),
+            Some("S1"),
+            Some("default"),
+            None
+        ));
+    }
+
+    #[test]
+    fn non_session_message_keeps_principal_only_routing() {
+        // Correlated/system responses (no session_id) reach every same-principal
+        // connection regardless of its session; a different principal is still
+        // excluded.
+        assert!(should_deliver(
+            Some("default"),
+            None,
+            Some("default"),
+            Some("S1")
+        ));
+        assert!(should_deliver(Some("default"), None, Some("default"), None));
+        assert!(!should_deliver(
+            Some("default"),
+            None,
+            Some("alice"),
+            Some("S1")
+        ));
+    }
+
+    // --- payload session extraction ---
+
+    #[test]
+    fn payload_session_id_extracts_top_level_string() {
+        let v = serde_json::json!({
+            "type": "agent_response",
+            "text": "hi",
+            "is_final": true,
+            "session_id": "S1"
+        });
+        assert_eq!(payload_session_id(&v), Some("S1"));
+    }
+
+    #[test]
+    fn payload_session_id_none_when_absent_or_not_a_string() {
+        assert_eq!(payload_session_id(&serde_json::json!({"text": "hi"})), None);
+        assert_eq!(
+            payload_session_id(&serde_json::json!({"session_id": 5})),
+            None
+        );
+        assert_eq!(
+            payload_session_id(&serde_json::json!("not-an-object")),
+            None
+        );
     }
 
     // --- attribution target mapping ---
