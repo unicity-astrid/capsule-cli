@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use astrid_sdk::net::{TcpStream, TryRecvError, bind_unix};
 use astrid_sdk::prelude::*;
 
@@ -172,6 +174,20 @@ const CHAT_REQUEST_TOPIC: &str = "user.v1.prompt";
 /// dropped for a connection that has not bound that session.
 const CHAT_RESPONSE_TOPIC: &str = "agent.v1.response";
 
+/// Topic carrying incremental chat tokens (`is_final: false` `AgentResponse`s)
+/// while the agent generates. Session-demuxed exactly like [`CHAT_RESPONSE_TOPIC`]
+/// — a streamed token must reach only the connection on that session, never a
+/// same-principal connection on a different one. Forwarded live for real-time
+/// display; the proxy accumulates them per session so the terminal
+/// [`CHAT_RESPONSE_TOPIC`] can be reconciled (see [`reconcile_stream_payload`]).
+const CHAT_DELTA_TOPIC: &str = "agent.v1.stream.delta";
+
+/// Upper bound on concurrently-streaming sessions the proxy accumulates text
+/// for. A turn always drops its entry on its terminal response, so this is only
+/// a defensive ceiling against a turn that never finalizes; far above the
+/// host-enforced 8-connection cap.
+const MAX_STREAM_SESSIONS: usize = 64;
+
 /// Extract the top-level `"session_id"` string from a message payload, if any.
 ///
 /// Low-level helper: the `IpcPayload` enum is internally tagged, so `session_id`
@@ -199,14 +215,79 @@ fn ingress_session_bind<'a>(topic: &str, payload: &'a serde_json::Value) -> Opti
 /// The conversation session an *outbound* message is scoped to for demux, or
 /// `None` to route by principal alone.
 ///
-/// Only streamed chat responses ([`CHAT_RESPONSE_TOPIC`]) are session-scoped.
-/// Correlated request/response replies keep principal routing even when their
-/// payload carries a `session_id`, so a connection awaiting such a reply (whose
-/// own session may not yet be bound) is never starved.
+/// Only streamed chat responses ([`CHAT_RESPONSE_TOPIC`]) and their incremental
+/// deltas ([`CHAT_DELTA_TOPIC`]) are session-scoped. Correlated request/response
+/// replies keep principal routing even when their payload carries a `session_id`,
+/// so a connection awaiting such a reply (whose own session may not yet be bound)
+/// is never starved.
 fn outbound_session_scope<'a>(topic: &str, payload: &'a serde_json::Value) -> Option<&'a str> {
-    (topic == CHAT_RESPONSE_TOPIC)
+    (topic == CHAT_RESPONSE_TOPIC || topic == CHAT_DELTA_TOPIC)
         .then(|| payload_session_id(payload))
         .flatten()
+}
+
+/// Reconcile a streamed chat payload against the per-session accumulator so the
+/// CLI TUI — which appends every `AgentResponse.text` it receives and flushes
+/// the buffer on `is_final` — renders the reply exactly once.
+///
+/// - A delta ([`CHAT_DELTA_TOPIC`]): record its text into the session's
+///   accumulator and forward it verbatim (the TUI appends it live).
+/// - The terminal ([`CHAT_RESPONSE_TOPIC`], `is_final: true`): the TUI has
+///   already received the streamed prefix, so rewrite the body to only the
+///   not-yet-streamed remainder (normally empty; a non-empty tail only when a
+///   delta was dropped) and drop the accumulator. A non-streaming turn (no
+///   deltas were seen for the session) keeps the full body untouched.
+///
+/// Mutates `payload` in place and updates `accum`. Relies on the delta
+/// subscription being polled before the response subscription each loop turn,
+/// so all deltas for a turn are accumulated before its terminal is reconciled.
+///
+/// Keyed by session, not connection: this is correct because a session is bound
+/// to a single connection (one client per session — a session retargets only
+/// from that connection's own chat prompt, see [`ingress_session_bind`]), so the
+/// one connection on a session has received every delta the terminal reconciles
+/// against. There is no second client on the same session to under-serve.
+fn reconcile_stream_payload(
+    topic: &str,
+    payload: &mut serde_json::Value,
+    accum: &mut HashMap<String, String>,
+) {
+    let Some(session) = payload_session_id(payload).map(str::to_string) else {
+        return;
+    };
+
+    if topic == CHAT_DELTA_TOPIC {
+        if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
+            // Bound growth: a turn always closes with a terminal response that
+            // drops its entry, but cap defensively so a turn that never
+            // finalizes can't leak unboundedly across the proxy's lifetime.
+            if accum.len() < MAX_STREAM_SESSIONS || accum.contains_key(&session) {
+                accum.entry(session).or_default().push_str(text);
+            }
+        }
+        return;
+    }
+
+    if topic == CHAT_RESPONSE_TOPIC
+        && payload
+            .get("is_final")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        && let Some(streamed) = accum.remove(&session)
+    {
+        // The streamed prefix already reached the TUI; send only the remainder.
+        // `strip_prefix` is `None` only if a delta was dropped mid-stream (the
+        // proxy logs such drops separately) — fall back to an empty body rather
+        // than re-sending the whole reply on top of the streamed text.
+        let full = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let remainder = full
+            .strip_prefix(streamed.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("text".to_string(), serde_json::Value::String(remainder));
+        }
+    }
 }
 
 /// Collapse an SDK [`ipc::PrincipalAttribution`] to the target principal for
@@ -233,7 +314,11 @@ impl CliProxy {
         // Internal pipeline events (LLM requests, tool dispatch, identity builds)
         // must NOT be forwarded to the CLI socket.
         let topics = [
-            "agent.v1.response",
+            // ORDER MATTERS: the delta topic precedes the response topic so the
+            // accumulator is filled before a turn's terminal is reconciled
+            // (subscriptions are polled in this order; see `reconcile_stream_payload`).
+            CHAT_DELTA_TOPIC,
+            CHAT_RESPONSE_TOPIC,
             "astrid.v1.onboarding.required",
             "astrid.v1.elicit.*",
             "astrid.v1.approval",
@@ -295,6 +380,12 @@ impl CliProxy {
         // fired after the connection's verified identity was already gone — the
         // host stamped it `anonymous`, so the real principal's count leaked.
         let mut clients: Vec<ProxyClient> = Vec::new();
+
+        // Per-session accumulator of streamed chat tokens, so the terminal
+        // `agent.v1.response` can be reconciled against what the TUI already
+        // rendered live (see `reconcile_stream_payload`). Entries are dropped on
+        // each turn's terminal response.
+        let mut stream_accum: HashMap<String, String> = HashMap::new();
 
         'proxy: loop {
             // Phase A: block until at least one client is connected.
@@ -380,7 +471,12 @@ impl CliProxy {
                 match sub.poll() {
                     Ok(result) => {
                         if !result.messages.is_empty() {
-                            broadcast_poll_messages(&clients, &result, &mut broadcast_dead);
+                            broadcast_poll_messages(
+                                &clients,
+                                &result,
+                                &mut stream_accum,
+                                &mut broadcast_dead,
+                            );
                         }
                     }
                     Err(_) => {
@@ -530,9 +626,14 @@ struct OutboundMessage {
 /// session so a bound connection only sees IPC stamped with its own principal
 /// (plus unprincipaled system events), and a chat response only when it is on
 /// that session. Tracks failed stream indices (into `clients`) in `dead`.
+///
+/// `stream_accum` carries streamed chat tokens across calls so a turn's terminal
+/// response can be reconciled against what was already streamed live (see
+/// [`reconcile_stream_payload`]).
 fn broadcast_poll_messages(
     clients: &[ProxyClient],
     poll_result: &ipc::PollResult,
+    stream_accum: &mut HashMap<String, String>,
     dead: &mut Vec<usize>,
 ) {
     if poll_result.dropped > 0 {
@@ -551,11 +652,15 @@ fn broadcast_poll_messages(
         .filter_map(|msg| {
             // Parse the payload string back to a JSON value so the TUI
             // receives an embedded object, not an escaped string.
-            let payload = serde_json::from_str::<serde_json::Value>(&msg.payload)
+            let mut payload = serde_json::from_str::<serde_json::Value>(&msg.payload)
                 .unwrap_or(serde_json::Value::String(msg.payload.clone()));
-            // Scope to a session only for chat responses (free off the already-
-            // parsed payload) so a chat response routes only to the connection on
-            // that session; correlated/system replies stay principal-routed.
+            // Accumulate streamed tokens and reconcile the terminal response so
+            // the TUI (append-then-flush) renders the reply exactly once.
+            reconcile_stream_payload(&msg.topic, &mut payload, stream_accum);
+            // Scope to a session only for chat responses + deltas (free off the
+            // already-parsed payload) so a streamed reply routes only to the
+            // connection on that session; correlated/system replies stay
+            // principal-routed.
             let session = outbound_session_scope(&msg.topic, &payload).map(str::to_string);
             let bytes = serde_json::to_vec(&serde_json::json!({
                 "topic": msg.topic,
@@ -903,6 +1008,131 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn outbound_scopes_session_for_streamed_deltas() {
+        // A streamed token must route only to the connection on its session,
+        // exactly like the terminal response — otherwise a same-principal
+        // connection on a different session would see another session's tokens.
+        let delta =
+            serde_json::json!({"type": "agent_response", "session_id": "S1", "is_final": false});
+        assert_eq!(outbound_session_scope(CHAT_DELTA_TOPIC, &delta), Some("S1"));
+        // No session_id on a delta falls back to principal routing.
+        assert_eq!(
+            outbound_session_scope(
+                CHAT_DELTA_TOPIC,
+                &serde_json::json!({"type": "agent_response"})
+            ),
+            None
+        );
+    }
+
+    // --- streamed-reply reconciliation (TUI renders the reply exactly once) ---
+
+    fn delta(session: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "agent_response", "session_id": session, "text": text, "is_final": false})
+    }
+    fn final_resp(session: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "agent_response", "session_id": session, "text": text, "is_final": true})
+    }
+    fn body(v: &serde_json::Value) -> &str {
+        v.get("text").and_then(|t| t.as_str()).unwrap_or("")
+    }
+
+    #[test]
+    fn reconcile_delta_is_forwarded_verbatim_and_accumulated() {
+        let mut accum = HashMap::new();
+        let mut p = delta("S1", "He");
+        reconcile_stream_payload(CHAT_DELTA_TOPIC, &mut p, &mut accum);
+        // The delta reaches the TUI unchanged (it appends it live)...
+        assert_eq!(body(&p), "He");
+        // ...and is recorded so the terminal can be reconciled against it.
+        assert_eq!(accum.get("S1").map(String::as_str), Some("He"));
+    }
+
+    #[test]
+    fn reconcile_terminal_after_deltas_sends_empty_remainder() {
+        let mut accum = HashMap::new();
+        for tok in ["He", "llo", " world"] {
+            let mut d = delta("S1", tok);
+            reconcile_stream_payload(CHAT_DELTA_TOPIC, &mut d, &mut accum);
+        }
+        // The terminal carries the full authoritative text; the TUI already has
+        // it from the deltas, so the body is rewritten to nothing (just flushes).
+        let mut term = final_resp("S1", "Hello world");
+        reconcile_stream_payload(CHAT_RESPONSE_TOPIC, &mut term, &mut accum);
+        assert_eq!(body(&term), "");
+        // The accumulator is dropped once the turn closes.
+        assert!(!accum.contains_key("S1"));
+    }
+
+    #[test]
+    fn reconcile_terminal_without_deltas_keeps_full_text() {
+        // A non-streaming provider emits only a terminal response (no deltas).
+        // The TUI has nothing buffered, so the full text must pass through.
+        let mut accum = HashMap::new();
+        let mut term = final_resp("S1", "the whole reply");
+        reconcile_stream_payload(CHAT_RESPONSE_TOPIC, &mut term, &mut accum);
+        assert_eq!(body(&term), "the whole reply");
+    }
+
+    #[test]
+    fn reconcile_terminal_fills_tail_after_dropped_delta() {
+        // A trailing delta was dropped (the proxy logs such drops separately):
+        // the accumulated prefix is shorter than the authoritative full text, so
+        // the terminal must carry the missing tail to complete the reply.
+        let mut accum = HashMap::new();
+        let mut d = delta("S1", "He");
+        reconcile_stream_payload(CHAT_DELTA_TOPIC, &mut d, &mut accum);
+        let mut term = final_resp("S1", "Hello");
+        reconcile_stream_payload(CHAT_RESPONSE_TOPIC, &mut term, &mut accum);
+        assert_eq!(body(&term), "llo");
+    }
+
+    #[test]
+    fn reconcile_terminal_on_mismatch_sends_empty_not_duplicate() {
+        // A non-prefix mismatch (a mid-stream drop) can't be cleanly appended to
+        // what the TUI already rendered, so prefer an empty body over re-sending
+        // the whole reply on top of the streamed text (visible duplication).
+        let mut accum = HashMap::new();
+        let mut d = delta("S1", "Hi there");
+        reconcile_stream_payload(CHAT_DELTA_TOPIC, &mut d, &mut accum);
+        let mut term = final_resp("S1", "Hello");
+        reconcile_stream_payload(CHAT_RESPONSE_TOPIC, &mut term, &mut accum);
+        assert_eq!(body(&term), "");
+    }
+
+    #[test]
+    fn reconcile_is_session_scoped_across_concurrent_streams() {
+        // Two sessions stream concurrently; each terminal reconciles against only
+        // its own accumulated tokens.
+        let mut accum = HashMap::new();
+        for (s, t) in [("S1", "alpha"), ("S2", "beta"), ("S1", "-1"), ("S2", "-2")] {
+            let mut d = delta(s, t);
+            reconcile_stream_payload(CHAT_DELTA_TOPIC, &mut d, &mut accum);
+        }
+        let mut t1 = final_resp("S1", "alpha-1");
+        let mut t2 = final_resp("S2", "beta-2");
+        reconcile_stream_payload(CHAT_RESPONSE_TOPIC, &mut t1, &mut accum);
+        reconcile_stream_payload(CHAT_RESPONSE_TOPIC, &mut t2, &mut accum);
+        assert_eq!(body(&t1), "");
+        assert_eq!(body(&t2), "");
+        assert!(accum.is_empty());
+    }
+
+    #[test]
+    fn reconcile_ignores_non_final_response() {
+        // Only the terminal (is_final) closes a turn; a non-final response on the
+        // response topic (defensive — react publishes is_final:true) is left as-is
+        // and does not consume the accumulator.
+        let mut accum = HashMap::new();
+        let mut d = delta("S1", "He");
+        reconcile_stream_payload(CHAT_DELTA_TOPIC, &mut d, &mut accum);
+        let mut not_final = serde_json::json!({"type": "agent_response", "session_id": "S1", "text": "x", "is_final": false});
+        reconcile_stream_payload(CHAT_RESPONSE_TOPIC, &mut not_final, &mut accum);
+        assert_eq!(body(&not_final), "x");
+        assert_eq!(accum.get("S1").map(String::as_str), Some("He"));
     }
 
     #[test]
